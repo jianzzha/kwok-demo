@@ -1,7 +1,9 @@
+import asyncio
 import kopf
 import jsonschema
 from kubernetes.client import (CoreV1Api, CustomObjectsApi)
 from kubernetes.client.rest import ApiException
+
 
 # Define the CRD schema for MyCustomResource
 MY_CUSTOM_RESOURCE_SCHEMA = {
@@ -108,3 +110,52 @@ def handle_pod_update(body, old, new, **kwargs):
 @kopf.on.create('pods')
 def handle_pod_creation(body, **kwargs):
     label_pod(body)
+
+
+def initialize(logger):
+    api = CoreV1Api()
+    custom_api_client = CustomObjectsApi()
+    try:
+        cr_list = custom_api_client.list_cluster_custom_object(
+                group='example.com',
+                version='v1',
+                plural='mycustomresources'
+        )
+    except ApiException as e:
+        logger.info("API error, CRD not defined")
+        return
+
+    logger.info(f"{cr_list}")
+    if cr_list and len(cr_list['items']) == 0:
+        logger.info("CR not defined")
+        return
+
+    for cr in cr_list['items']:
+        namespace = cr['metadata']['namespace']
+        data = cr.get('spec', {}).get('data')
+        if not data:
+            continue
+        pods = api.list_namespaced_pod(namespace=namespace).items
+        for pod in pods:
+            if 'mycustomresource/data' not in pod.metadata.labels or \
+                pod.metadata.labels['mycustomresource/data'] != data:
+                pod.metadata.labels['mycustomresource/data'] = data
+                api.patch_namespaced_pod(
+                    pod.metadata.name,
+                    pod.metadata.namespace,
+                    {'metadata': {'labels': pod.metadata.labels}}
+                )
+
+
+async def delayed_task(logger):
+    await asyncio.sleep(1)
+    initialize(logger)
+
+
+@kopf.on.startup()
+async def startup_handler(logger, **kwargs):
+    task = asyncio.create_task(delayed_task(logger))
+
+
+if __name__ == '__main__':
+    kopf.run()
